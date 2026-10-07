@@ -1,0 +1,11 @@
+# 秘密情報（Botトークン・Google認証情報）。コミットしないこと
+config.yaml
+client_secret.json
+token.pickle
+
+# 実行時に作られるもの
+logs/
+__pycache__/
+*.pyc
+.venv/
+venv/

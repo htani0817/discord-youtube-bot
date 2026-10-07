@@ -46,7 +46,8 @@ bot:
   # プレイリスト追加成功時にDiscordに通知するか
   notify_on_success: true
 
-  # エラー時にDiscordに通知するか（デバッグ用）
+  # 動画を追加できなかったとき・起動時にYouTube APIの準備ができなかったときに、Discordに通知するか
+  # 失敗に気づけるよう、運用では true をおすすめします
   notify_on_error: false
 
   # Bot起動時にチャンネルに通知するか

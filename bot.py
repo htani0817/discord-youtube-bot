@@ -10,10 +10,11 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta
 from pathlib import Path
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import pickle
+import time
 
 # =============================================================================
 # 設定ファイル読み込み
@@ -203,6 +204,9 @@ def get_authenticated_service():
             creds.refresh(Request())
             logger.info("認証情報をリフレッシュしました")
         else:
+            # systemdなど、ターミナルのない環境ではブラウザ認証を待てない（待ち続けてBot全体が固まってしまう）
+            if not (sys.stdin and sys.stdin.isatty()):
+                raise RuntimeError("新規認証が必要です。ターミナルで python3 bot.py を実行して認証してください。")
             logger.info("新規認証が必要です。ブラウザで認証してください...")
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
@@ -235,33 +239,99 @@ URL_PATTERN = re.compile(r"https?://\S+")
 # =============================================================================
 # YouTube API操作
 # =============================================================================
+# YouTube APIの状態。認証とプレイリスト一覧の取得が両方できるまでは None
+youtube_service = None
+existing_video_ids = None
+
+# 準備に失敗したあと、次に試すまで空ける秒数（URLが投稿されるたびに再試行しないため）
+YOUTUBE_RETRY_INTERVAL = 60
+# 起動時に準備へ失敗したときの待ち時間（秒）。1回ごとに待って再試行し、使い切っても失敗なら諦める
+STARTUP_RETRY_WAITS = (10, 30, 60)
+
+last_prepare_failed_at = None  # 直近で準備に失敗した時刻（time.monotonic）
+startup_started = False  # 起動処理に着手済みか（再接続のたびに on_ready が呼ばれても、やり直さないため）
+
 def get_playlist_video_ids(service, playlist_id):
-    """プレイリスト内の既存のビデオIDを取得する"""
+    """プレイリスト内の既存のビデオIDを取得する。取得に失敗したら例外を投げる"""
     video_ids = set()
-    try:
-        request = service.playlistItems().list(
-            part="snippet",
-            playlistId=playlist_id,
-            maxResults=50
-        )
-        while request:
-            response = request.execute()
-            for item in response["items"]:
-                video_ids.add(item["snippet"]["resourceId"]["videoId"])
-            request = service.playlistItems().list_next(request, response)
-        logger.debug(f"プレイリストから{len(video_ids)}件のビデオIDを取得しました")
-    except Exception as e:
-        logger.error(f"プレイリストの取得中にエラーが発生しました: {e}")
+    request = service.playlistItems().list(
+        part="snippet",
+        playlistId=playlist_id,
+        maxResults=50
+    )
+    while request:
+        response = request.execute()
+        for item in response["items"]:
+            video_ids.add(item["snippet"]["resourceId"]["videoId"])
+        request = service.playlistItems().list_next(request, response)
+    logger.debug(f"プレイリストから{len(video_ids)}件のビデオIDを取得しました")
     return video_ids
 
+def prepare_youtube():
+    """YouTube APIの認証とプレイリスト一覧の取得を行う。準備できたら True、できなければ False を返す
+
+    一覧を取得できないまま追加を始めると、すでに入っている動画を重複して追加してしまう。
+    そのため、認証と一覧の取得が両方できたときだけ「準備できた」とみなす。
+    """
+    global youtube_service, existing_video_ids, last_prepare_failed_at
+    try:
+        if youtube_service is None:
+            youtube_service = get_authenticated_service()
+            logger.info("YouTube APIの認証が完了しました")
+
+        logger.info("既存のプレイリスト内容を取得しています...")
+        video_ids = get_playlist_video_ids(youtube_service, YOUTUBE_PLAYLIST_ID)
+    except Exception as e:
+        last_prepare_failed_at = time.monotonic()
+        logger.error(f"YouTube APIの準備に失敗しました: {e}")
+        if isinstance(e, RefreshError):
+            logger.error(
+                "認証の期限切れ、または取り消しの可能性があります。"
+                "token.pickleを削除し、ターミナルで python3 bot.py を実行して再認証してください。"
+            )
+        return False
+
+    existing_video_ids = video_ids
+    last_prepare_failed_at = None
+    logger.info(f"{len(existing_video_ids)} 件の動画が既にプレイリストに存在します。")
+    return True
+
+def ensure_youtube_ready():
+    """追加の前に、YouTube APIの準備ができているか確認する。未完了なら、間隔を空けて再試行する"""
+    if existing_video_ids is not None:
+        return True
+    if last_prepare_failed_at is not None and time.monotonic() - last_prepare_failed_at < YOUTUBE_RETRY_INTERVAL:
+        return False
+    logger.info("YouTube APIの準備をやり直します...")
+    return prepare_youtube()
+
+def is_already_in_playlist_error(error):
+    """APIが「既にプレイリストにある」と返したエラーかを判定する（理由コードとメッセージの表記ゆれを吸収）"""
+    return "alreadyinplaylist" in str(error).lower().replace(" ", "")
+
+async def send_message(channel, text):
+    """チャンネルにメッセージを送る。送信に失敗しても、プレイリストへの追加処理には影響させない"""
+    try:
+        await channel.send(text)
+    except Exception as e:
+        logger.error(f"チャンネルへのメッセージ送信に失敗: {e}")
+
 async def add_video_to_playlist(video_id, channel):
-    """動画をプレイリストに追加する"""
-    global existing_video_ids
-    
+    """動画をプレイリストに追加する。追加できたら True、追加しなかった（既にある・失敗）なら False を返す"""
+    # 認証とプレイリスト一覧の取得が済んでいないと、重複を判定できないので追加しない
+    if not ensure_youtube_ready():
+        logger.error(f"YouTube APIの準備ができていないため、ビデオID {video_id} を追加できませんでした。")
+        if NOTIFY_ON_ERROR:
+            await send_message(channel, "エラーが発生したため、動画をプレイリストに追加できませんでした。")
+        return False
+
     if video_id in existing_video_ids:
         logger.info(f"ビデオID {video_id} は既にプレイリストに存在します。")
-        return
+        return False
 
+    # 追加の途中（通知の送信待ちなど）に同じ動画が届いても二重に追加しないよう、先に「入っている」ことにする。
+    # 追加に失敗したときは取り消す
+    existing_video_ids.add(video_id)
     try:
         logger.debug(f"ビデオID {video_id} をプレイリストに追加中...")
         request = youtube_service.playlistItems().insert(
@@ -274,24 +344,26 @@ async def add_video_to_playlist(video_id, channel):
             },
         )
         response = request.execute()
-        title = response['snippet']['title']
-        logger.info(f"動画がプレイリストに追加されました: {title} (ID: {video_id})")
-        
-        if NOTIFY_ON_SUCCESS:
-            await channel.send(
-                f"動画「{title}」をプレイリストに追加しました！\n"
-                f"URL: https://www.youtube.com/playlist?list={YOUTUBE_PLAYLIST_ID}"
-            )
-        existing_video_ids.add(video_id)
-        
     except Exception as e:
-        if "video already in playlist" in str(e):
+        if is_already_in_playlist_error(e):
             logger.debug(f"ビデオID {video_id} はAPI側で重複と判断されました。")
-            existing_video_ids.add(video_id)
-        else:
-            logger.error(f"プレイリストへの追加中にエラーが発生しました: {e}")
-            if NOTIFY_ON_ERROR:
-                await channel.send("エラーが発生したため、動画をプレイリストに追加できませんでした。")
+            return False
+        existing_video_ids.discard(video_id)
+        logger.error(f"プレイリストへの追加中にエラーが発生しました: {e}")
+        if NOTIFY_ON_ERROR:
+            await send_message(channel, "エラーが発生したため、動画をプレイリストに追加できませんでした。")
+        return False
+
+    title = response['snippet']['title']
+    logger.info(f"動画がプレイリストに追加されました: {title} (ID: {video_id})")
+
+    if NOTIFY_ON_SUCCESS:
+        await send_message(
+            channel,
+            f"動画「{title}」をプレイリストに追加しました！\n"
+            f"URL: https://www.youtube.com/playlist?list={YOUTUBE_PLAYLIST_ID}"
+        )
+    return True
 
 # =============================================================================
 # Discordイベントハンドラ
@@ -310,20 +382,37 @@ async def send_to_all_channels(message_text):
 @client.event
 async def on_ready():
     """Bot起動時の処理"""
+    global startup_started
     logger.info(f"{client.user} としてログインしました")
 
-    # 起動メッセージを送信
+    # 再接続のたびに on_ready は呼ばれる（discord.pyの仕様）。起動処理は最初の1回だけ行う
+    if startup_started:
+        logger.info("再接続しました。起動処理は実行済みのため、スキップします。")
+        return
+    startup_started = True
+
+    # YouTube APIの認証と既存動画の取得。失敗したら、少し待って再試行する
+    ready = prepare_youtube()
+    for wait in STARTUP_RETRY_WAITS:
+        if ready:
+            break
+        logger.warning(f"{wait}秒後にYouTube APIの準備をやり直します。")
+        await asyncio.sleep(wait)
+        ready = prepare_youtube()
+
+    if not ready:
+        # 一覧を取得できないまま履歴をスキャンすると、入っている動画を重複して追加してしまうので、スキャンしない
+        logger.critical(
+            "YouTube APIの準備ができませんでした。過去メッセージのスキャンは行いません。"
+            "URLが投稿されたときに、もう一度準備を試みます。"
+        )
+        if NOTIFY_ON_ERROR:
+            await send_to_all_channels("⚠️ YouTube APIの準備に失敗したため、プレイリストに追加できません。ログを確認してください。")
+        return
+
+    # 起動メッセージを送信（認証と既存動画の取得が済んでから）
     if NOTIFY_ON_START:
         await send_to_all_channels("🟢 YouTube Playlist Bot が起動しました。")
-
-    # YouTube APIサービスの認証と既存動画の取得
-    global youtube_service, existing_video_ids
-    youtube_service = get_authenticated_service()
-    logger.info("YouTube APIの認証が完了しました")
-
-    logger.info("既存のプレイリスト内容を取得しています...")
-    existing_video_ids = get_playlist_video_ids(youtube_service, YOUTUBE_PLAYLIST_ID)
-    logger.info(f"{len(existing_video_ids)} 件の動画が既にプレイリストに存在します。")
 
     # 各監視対象チャンネルの履歴をスキャン
     logger.info("過去のメッセージをスキャンしています...")
@@ -342,9 +431,7 @@ async def on_ready():
                         match = YOUTUBE_URL_PATTERN.search(message.content)
                         if match:
                             video_id = match.group(1)
-                            before_count = len(existing_video_ids)
-                            await add_video_to_playlist(video_id, channel)
-                            if len(existing_video_ids) > before_count:
+                            if await add_video_to_playlist(video_id, channel):
                                 added_count += 1
                         message_count += 1
                     logger.debug(f"チャンネル「{channel.name}」: {message_count}件のメッセージをスキャンしました")
